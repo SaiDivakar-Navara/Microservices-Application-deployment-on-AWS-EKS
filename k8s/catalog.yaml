@@ -1,0 +1,62 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: catalog-service
+  namespace: polyglot-commerce
+spec:
+  replicas: 1
+
+  selector:
+    matchLabels:
+      app: catalog-service
+
+  template:
+    metadata:
+      labels:
+        app: catalog-service
+
+    spec:
+      containers:
+        - name: catalog-service
+          image: 249123960212.dkr.ecr.ap-south-1.amazonaws.com/catalog-service:1.0
+
+          ports:
+            - containerPort: 8082
+
+          env:
+            - name: CATALOG_DB_DSN
+              valueFrom:
+                secretKeyRef:
+                  name: postgres-app-secret
+                  key: CATALOG_DB_DSN
+
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: 8082
+            initialDelaySeconds: 10
+            periodSeconds: 10
+
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: 8082
+            initialDelaySeconds: 20
+            periodSeconds: 20
+
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: catalog-service
+  namespace: polyglot-commerce
+
+spec:
+  selector:
+    app: catalog-service
+
+  ports:
+    - port: 8082
+      targetPort: 8082
+
+  type: ClusterIP

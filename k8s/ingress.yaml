@@ -1,0 +1,253 @@
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: polyglot-commerce-ingress
+  namespace: polyglot-commerce
+
+  annotations:
+    alb.ingress.kubernetes.io/scheme: internet-facing
+    alb.ingress.kubernetes.io/target-type: ip
+    alb.ingress.kubernetes.io/listen-ports: '[{"HTTP":80}]'
+    alb.ingress.kubernetes.io/healthcheck-path: /
+
+    # =========================
+    # AUTH REWRITE
+    # /api/auth/auth/login
+    #        ↓
+    # /auth/login
+    # =========================
+    alb.ingress.kubernetes.io/transforms.auth-service: >
+      [
+        {
+          "type": "url-rewrite",
+          "urlRewriteConfig": {
+            "rewrites": [
+              {
+                "regex": "^/api/auth/auth/(.+)$",
+                "replace": "/auth/$1"
+              }
+            ]
+          }
+        }
+      ]
+
+    # =========================
+    # CATALOG REWRITE
+    # /api/catalog/products
+    #        ↓
+    # /products
+    # =========================
+    alb.ingress.kubernetes.io/transforms.catalog-service: >
+      [
+        {
+          "type": "url-rewrite",
+          "urlRewriteConfig": {
+            "rewrites": [
+              {
+                "regex": "^/api/catalog/(.+)$",
+                "replace": "/$1"
+              }
+            ]
+          }
+        }
+      ]
+
+    # =========================
+    # INVENTORY REWRITE
+    # /api/inventory/inventory
+    #        ↓
+    # /inventory
+    # =========================
+    alb.ingress.kubernetes.io/transforms.inventory-service: >
+      [
+        {
+          "type": "url-rewrite",
+          "urlRewriteConfig": {
+            "rewrites": [
+              {
+                "regex": "^/api/inventory/(.+)$",
+                "replace": "/$1"
+              }
+            ]
+          }
+        }
+      ]
+
+    # =========================
+    # ORDER REWRITE
+    # /api/orders/orders
+    #        ↓
+    # /orders
+    # =========================
+    alb.ingress.kubernetes.io/transforms.order-service: >
+      [
+        {
+          "type": "url-rewrite",
+          "urlRewriteConfig": {
+            "rewrites": [
+              {
+                "regex": "^/api/orders/(.+)$",
+                "replace": "/$1"
+              }
+            ]
+          }
+        }
+      ]
+
+    # =========================
+    # PAYMENT REWRITE
+    # /api/payments/payments
+    #        ↓
+    # /payments
+    # =========================
+    alb.ingress.kubernetes.io/transforms.payment-service: >
+      [
+        {
+          "type": "url-rewrite",
+          "urlRewriteConfig": {
+            "rewrites": [
+              {
+                "regex": "^/api/payments/(.+)$",
+                "replace": "/$1"
+              }
+            ]
+          }
+        }
+      ]
+
+    # =========================
+    # NOTIFICATION REWRITE
+    # /api/notifications/notifications
+    #        ↓
+    # /notifications
+    # =========================
+    alb.ingress.kubernetes.io/transforms.notification-service: >
+      [
+        {
+          "type": "url-rewrite",
+          "urlRewriteConfig": {
+            "rewrites": [
+              {
+                "regex": "^/api/notifications/(.+)$",
+                "replace": "/$1"
+              }
+            ]
+          }
+        }
+      ]
+
+    # =========================
+    # ANALYTICS REWRITE
+    # /api/analytics/analytics/summary
+    #        ↓
+    # /analytics/summary
+    # =========================
+    alb.ingress.kubernetes.io/transforms.analytics-service: >
+      [
+        {
+          "type": "url-rewrite",
+          "urlRewriteConfig": {
+            "rewrites": [
+              {
+                "regex": "^/api/analytics/(.+)$",
+                "replace": "/$1"
+              }
+            ]
+          }
+        }
+      ]
+
+spec:
+  ingressClassName: alb
+
+  rules:
+    - http:
+        paths:
+
+          # =========================
+          # FRONTEND
+          # =========================
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: frontend
+                port:
+                  number: 80
+
+          # =========================
+          # AUTH
+          # =========================
+          - path: /api/auth
+            pathType: Prefix
+            backend:
+              service:
+                name: auth-service
+                port:
+                  number: 8081
+
+          # =========================
+          # CATALOG
+          # =========================
+          - path: /api/catalog
+            pathType: Prefix
+            backend:
+              service:
+                name: catalog-service
+                port:
+                  number: 8082
+
+          # =========================
+          # INVENTORY
+          # =========================
+          - path: /api/inventory
+            pathType: Prefix
+            backend:
+              service:
+                name: inventory-service
+                port:
+                  number: 8083
+
+          # =========================
+          # ORDERS
+          # =========================
+          - path: /api/orders
+            pathType: Prefix
+            backend:
+              service:
+                name: order-service
+                port:
+                  number: 8084
+
+          # =========================
+          # PAYMENTS
+          # =========================
+          - path: /api/payments
+            pathType: Prefix
+            backend:
+              service:
+                name: payment-service
+                port:
+                  number: 8085
+
+          # =========================
+          # NOTIFICATIONS
+          # =========================
+          - path: /api/notifications
+            pathType: Prefix
+            backend:
+              service:
+                name: notification-service
+                port:
+                  number: 8086
+
+          # =========================
+          # ANALYTICS
+          # =========================
+          - path: /api/analytics
+            pathType: Prefix
+            backend:
+              service:
+                name: analytics-service
+                port:
+                  number: 8087

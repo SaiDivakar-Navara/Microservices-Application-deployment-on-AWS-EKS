@@ -1,0 +1,53 @@
+7-Microservice-Project/
+│
+├── database/
+│   └── bootstrap.sql
+│
+├── frontend/
+│   ├── src/
+│   ├── Dockerfile
+│   ├── nginx.conf
+│   ├── package.json
+│   └── vite.config.js
+│
+├── services/
+│   ├── auth-service/          # Java 21 + Spring Boot
+│   ├── catalog-service/       # Go
+│   ├── inventory-service/     # Node.js + Express
+│   ├── order-service/         # Python + FastAPI
+│   ├── payment-service/       # C# + ASP.NET Core
+│   ├── notification-service/  # Ruby + Sinatra
+│   └── analytics-service/     # PHP
+│
+├── k8s/
+│   ├── auth.yaml
+│   ├── catalog.yaml
+│   ├── inventory.yaml
+│   ├── order.yaml
+│   ├── payment.yaml
+│   ├── notification.yaml
+│   ├── analytics.yaml
+│   ├── frontend.yaml
+│   └── ingress.yaml
+│
+├── docs/
+│   └── screenshots/            # ← naya added, app + AWS proof screenshots
+│       ├── 01-overview-dashboard.png
+│       ├── 02-catalog-service.png
+│       ├── 03-orders-cart.png
+│       ├── 04-notifications-1.png
+│       ├── 05-payments-ledger.png
+│       ├── 06-notifications-2.png
+│       ├── 07-analytics-dashboard.png
+│       ├── 08-kubectl-get-pods.png
+│       ├── 09-eks-cluster.png
+│       ├── 10-ec2-instances.png
+│       ├── 11-rds-postgres.png
+│       └── 12-ecr-repositories.png
+│
+├── scripts/
+├── docker-compose.yml
+├── ARCHITECTURE.md
+├── PROJECT-STRUCTURE.txt
+├── Steps.md
+└── README.md
