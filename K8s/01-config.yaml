@@ -1,0 +1,28 @@
+# Shared settings for every backend service.
+# Edit DB_HOST and DB_PASSWORD before applying. Do not commit real secrets to Git.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: verve-config
+  namespace: verve
+data:
+  DB_HOST: <RDS_ENDPOINT>
+  DB_PORT: "5432"
+  DB_USER: verve
+  DB_SSLMODE: require
+  AUTH_URL: http://auth-service:8081
+  CATALOG_URL: http://catalog-service:8082
+  INVENTORY_URL: http://inventory-service:8083
+  ORDER_URL: http://order-service:8084
+  PAYMENT_URL: http://payment-service:8085
+  NOTIFICATION_URL: http://notification-service:8086
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: verve-secret
+  namespace: verve
+type: Opaque
+stringData:
+  DB_PASSWORD: verve_pass   # must match the password in database/init.sql
+  INTERNAL_API_KEY: change-me-to-a-long-random-string

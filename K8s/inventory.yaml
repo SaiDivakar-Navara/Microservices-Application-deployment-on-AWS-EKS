@@ -1,0 +1,60 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: inventory-service
+  namespace: verve
+  labels:
+    app: inventory-service
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: inventory-service
+  template:
+    metadata:
+      labels:
+        app: inventory-service
+    spec:
+      containers:
+        - name: inventory-service
+          image: <ACCOUNT_ID>.dkr.ecr.<REGION>.amazonaws.com/inventory-service:1.0
+          ports:
+            - containerPort: 8083
+          envFrom:
+            - configMapRef:
+                name: verve-config
+            - secretRef:
+                name: verve-secret
+          env:
+            - name: DB_NAME
+              value: inventory_db
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: 8083
+            initialDelaySeconds: 10
+            periodSeconds: 10
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: 8083
+            initialDelaySeconds: 30
+            periodSeconds: 20
+          resources:
+            requests:
+              cpu: 100m
+              memory: 128Mi
+            limits:
+              memory: 384Mi
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: inventory-service
+  namespace: verve
+spec:
+  selector:
+    app: inventory-service
+  ports:
+    - port: 8083
+      targetPort: 8083
