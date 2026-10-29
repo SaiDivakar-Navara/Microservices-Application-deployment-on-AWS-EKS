@@ -1,197 +1,239 @@
-import os
-from decimal import Decimal
-from typing import Literal
+import logging
+from decimal import ROUND_HALF_UP, Decimal
+from typing import Optional
 
 import httpx
-import psycopg2
-from psycopg2.extras import RealDictCursor, Json
-from fastapi import FastAPI, HTTPException
-from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel, EmailStr, Field
+from fastapi import Depends, FastAPI, Header, HTTPException, Request
+from fastapi.exceptions import RequestValidationError
+from fastapi.responses import JSONResponse
 
-DB_DSN = os.getenv(
-    "ORDER_DB_DSN",
-    "dbname=order_db user=microapp password=microapp123 host=127.0.0.1 port=5432",
-)
-CATALOG_URL = os.getenv("CATALOG_URL", "http://localhost:8082")
-INVENTORY_URL = os.getenv("INVENTORY_URL", "http://localhost:8083")
-NOTIFICATION_URL = os.getenv("NOTIFICATION_URL", "http://localhost:8086")
+from . import clients, config, db
+from .schemas import OrderCreate, StatusUpdate
 
-app = FastAPI(title="DevOps Shack Order Service", version="1.0.0")
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s %(message)s")
+log = logging.getLogger("order-service")
 
-def conn():
-    return psycopg2.connect(DB_DSN, cursor_factory=RealDictCursor)
+app = FastAPI(title="Verve Order Service", version="1.0.0", docs_url="/api/orders/docs", openapi_url="/api/orders/openapi.json")
 
-def migrate():
-    with conn() as db:
-        with db.cursor() as cur:
-            cur.execute("""
-                CREATE TABLE IF NOT EXISTS orders (
-                    id BIGSERIAL PRIMARY KEY,
-                    user_email VARCHAR(200) NOT NULL,
-                    status VARCHAR(40) NOT NULL DEFAULT 'CREATED',
-                    total NUMERIC(12,2) NOT NULL CHECK(total>=0),
-                    items JSONB NOT NULL,
-                    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-                    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
-                )
-            """)
 
-migrate()
+@app.on_event("startup")
+def startup() -> None:
+    db.init_pool()
+    db.migrate()
 
-class OrderItemIn(BaseModel):
-    product_id: int
-    quantity: int = Field(gt=0, le=100)
 
-class OrderCreate(BaseModel):
-    user_email: EmailStr
-    items: list[OrderItemIn]
+# ---------- errors: always {"error": "..."} ----------
+@app.exception_handler(HTTPException)
+async def http_error(_req: Request, exc: HTTPException):
+    return JSONResponse({"error": exc.detail}, status_code=exc.status_code)
 
-class StatusUpdate(BaseModel):
-    status: Literal["CREATED", "PAID", "PROCESSING", "SHIPPED", "CANCELLED", "REFUNDED"]
 
-def serialize(row):
-    if row is None:
-        return None
-    out = dict(row)
-    if isinstance(out.get("total"), Decimal):
-        out["total"] = float(out["total"])
-    return out
+@app.exception_handler(RequestValidationError)
+async def validation_error(_req: Request, exc: RequestValidationError):
+    first = exc.errors()[0]
+    where = ".".join(str(p) for p in first["loc"] if p != "body")
+    return JSONResponse({"error": f"{where}: {first['msg']}" if where else first["msg"]}, status_code=422)
 
+
+@app.exception_handler(httpx.HTTPError)
+async def upstream_error(_req: Request, exc: httpx.HTTPError):
+    log.error("upstream call failed: %s", exc)
+    return JSONResponse({"error": "a required service is unavailable, please try again"}, status_code=503)
+
+
+# ---------- identity ----------
+class Caller(dict):
+    @property
+    def is_admin(self) -> bool:
+        return self.get("role") == "ADMIN" or self.get("internal", False)
+
+
+def caller(authorization: Optional[str] = Header(default=None), x_internal_key: Optional[str] = Header(default=None)) -> Caller:
+    if x_internal_key == config.INTERNAL_API_KEY:
+        return Caller(internal=True, role="ADMIN")
+    user = clients.lookup_user(authorization)
+    if not user:
+        raise HTTPException(401, "sign in required")
+    return Caller(user)
+
+
+def internal_only(x_internal_key: Optional[str] = Header(default=None)) -> None:
+    if x_internal_key != config.INTERNAL_API_KEY:
+        raise HTTPException(403, "internal endpoint")
+
+
+# ---------- helpers ----------
+def money(value: Decimal) -> Decimal:
+    return value.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+
+
+def load_orders(cur, where: str = "", params: tuple = (), limit: int = 200) -> list[dict]:
+    cur.execute(f"SELECT * FROM orders {where} ORDER BY id DESC LIMIT %s", params + (limit,))
+    orders = cur.fetchall()
+    if not orders:
+        return []
+    ids = [o["id"] for o in orders]
+    cur.execute("SELECT * FROM order_items WHERE order_id = ANY(%s) ORDER BY id", (ids,))
+    by_order: dict[int, list] = {}
+    for item in cur.fetchall():
+        by_order.setdefault(item["order_id"], []).append(item)
+    for order in orders:
+        order["items"] = by_order.get(order["id"], [])
+    return orders
+
+
+def load_order(order_id: int) -> dict:
+    with db.transaction() as cur:
+        rows = load_orders(cur, "WHERE id = %s", (order_id,))
+    if not rows:
+        raise HTTPException(404, "order not found")
+    return rows[0]
+
+
+def ensure_access(order: dict, who: Caller) -> None:
+    if not who.is_admin and order["user_id"] != who.get("id"):
+        raise HTTPException(404, "order not found")  # do not reveal other people's order IDs
+
+
+# ---------- health ----------
 @app.get("/health")
+@app.get("/api/orders/health")
 def health():
-    with conn() as db:
-        with db.cursor() as cur:
+    try:
+        with db.transaction() as cur:
             cur.execute("SELECT 1")
+    except Exception:
+        return JSONResponse({"service": "order-service", "status": "DOWN"}, status_code=503)
     return {"service": "order-service", "status": "UP", "language": "Python"}
 
-@app.get("/orders")
-def list_orders():
-    with conn() as db:
-        with db.cursor() as cur:
-            cur.execute("SELECT * FROM orders ORDER BY id DESC")
-            return [serialize(x) for x in cur.fetchall()]
 
-@app.get("/orders/{order_id}")
-def get_order(order_id: int):
-    with conn() as db:
-        with db.cursor() as cur:
-            cur.execute("SELECT * FROM orders WHERE id=%s", (order_id,))
-            row = cur.fetchone()
-    if not row:
-        raise HTTPException(404, "order not found")
-    return serialize(row)
+# ---------- orders ----------
+@app.post("/api/orders", status_code=201)
+def create_order(payload: OrderCreate, who: Caller = Depends(caller)):
+    if who.get("internal"):
+        raise HTTPException(403, "orders must be placed by a signed-in shopper")
 
-@app.post("/orders", status_code=201)
-async def create_order(payload: OrderCreate):
-    if not payload.items:
-        raise HTTPException(400, "at least one item is required")
+    # Merge duplicate lines, then price everything from the catalog (never trust client prices).
+    wanted: dict[int, int] = {}
+    for item in payload.items:
+        wanted[item.product_id] = wanted.get(item.product_id, 0) + item.quantity
 
-    enriched = []
-    reserve_items = []
-    total = Decimal("0.00")
+    lines, subtotal = [], Decimal("0")
+    for product_id, quantity in sorted(wanted.items()):
+        product = clients.get_product(product_id)
+        if product is None or not product.get("active", True):
+            raise HTTPException(409, f"product {product_id} is no longer available")
+        unit = Decimal(str(product["price"]))
+        line_total = money(unit * quantity)
+        subtotal += line_total
+        lines.append({
+            "product_id": product_id, "name": product["name"], "category": product["category"],
+            "emoji": product["emoji"], "color": product["color"],
+            "unit_price": unit, "quantity": quantity, "line_total": line_total,
+        })
 
-    async with httpx.AsyncClient(timeout=5.0) as client:
-        for item in payload.items:
-            response = await client.get(f"{CATALOG_URL}/products/{item.product_id}")
-            if response.status_code == 404:
-                raise HTTPException(400, f"product {item.product_id} not found")
-            response.raise_for_status()
-            product = response.json()
+    shipping = Decimal("0.00") if subtotal >= Decimal(config.FREE_SHIPPING_THRESHOLD) else Decimal(config.FLAT_SHIPPING)
+    tax = money(subtotal * Decimal(config.TAX_RATE))
+    total = money(subtotal + shipping + tax)
 
-            if not product.get("active", True):
-                raise HTTPException(409, f"product {item.product_id} is inactive")
-
-            unit_price = Decimal(str(product["price"]))
-            line_total = unit_price * item.quantity
-            total += line_total
-
-            enriched.append({
-                "product_id": item.product_id,
-                "name": product["name"],
-                "quantity": item.quantity,
-                "unit_price": float(unit_price),
-                "line_total": float(line_total),
-            })
-            reserve_items.append({"productId": item.product_id, "quantity": item.quantity})
-
-        reserve = await client.post(
-            f"{INVENTORY_URL}/inventory/reserve",
-            json={"items": reserve_items},
-        )
-        if reserve.status_code >= 400:
-            try:
-                detail = reserve.json().get("error", "inventory reservation failed")
-            except Exception:
-                detail = "inventory reservation failed"
-            raise HTTPException(409, detail)
-
-        try:
-            with conn() as db:
-                with db.cursor() as cur:
-                    cur.execute("""
-                        INSERT INTO orders(user_email,status,total,items)
-                        VALUES(%s,'CREATED',%s,%s)
-                        RETURNING *
-                    """, (str(payload.user_email), total, Json(enriched)))
-                    row = cur.fetchone()
-        except Exception:
-            await client.post(
-                f"{INVENTORY_URL}/inventory/release",
-                json={"items": reserve_items},
+    reserved = False
+    try:
+        with db.transaction() as cur:
+            cur.execute(
+                """INSERT INTO orders (user_id, user_email, user_name, subtotal, shipping, tax, total, shipping_address)
+                   VALUES (%s,%s,%s,%s,%s,%s,%s,%s) RETURNING id""",
+                (who["id"], who["email"], who.get("name", ""), money(subtotal), shipping, tax, total,
+                 db.json_value(payload.shipping_address.model_dump())),
             )
-            raise
+            order_id = cur.fetchone()["id"]
+            for line in lines:
+                cur.execute(
+                    """INSERT INTO order_items (order_id, product_id, name, category, emoji, color, unit_price, quantity, line_total)
+                       VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s)""",
+                    (order_id, line["product_id"], line["name"], line["category"], line["emoji"], line["color"],
+                     line["unit_price"], line["quantity"], line["line_total"]),
+                )
+            ok, body = clients.reserve_stock(order_id, [{"product_id": l["product_id"], "quantity": l["quantity"]} for l in lines])
+            if not ok:
+                names = {l["product_id"]: l["name"] for l in lines}
+                short = body.get("shortages", [])
+                detail = ", ".join(f"{names.get(s['product_id'], s['product_id'])} (only {s['available']} left)" for s in short)
+                raise HTTPException(409, f"Not enough stock: {detail}" if detail else body.get("error", "Not enough stock"))
+            reserved = True
+    except Exception:
+        if reserved:
+            clients.release_stock(order_id)
+        raise
 
-        try:
-            await client.post(
-                f"{NOTIFICATION_URL}/notifications",
-                json={
-                    "recipient": str(payload.user_email),
-                    "type": "ORDER",
-                    "subject": f"Order #{row['id']} created",
-                    "message": f"Your order was created successfully. Total: ${float(total):.2f}",
-                },
-            )
-        except Exception:
-            pass
+    clients.notify(who["email"], "ORDER_PLACED", f"Order #{order_id} received",
+                   f"We reserved your items. Complete payment of ${total:.2f} to confirm order #{order_id}.", order_id)
+    return load_order(order_id)
 
-    return serialize(row)
 
-@app.put("/orders/{order_id}/status")
-async def update_status(order_id: int, payload: StatusUpdate):
-    with conn() as db:
-        with db.cursor() as cur:
-            cur.execute("SELECT * FROM orders WHERE id=%s", (order_id,))
-            existing = cur.fetchone()
+@app.get("/api/orders")
+def list_orders(all: bool = False, status: Optional[str] = None, who: Caller = Depends(caller)):
+    clauses, params = [], []
+    if not (all and who.is_admin):
+        clauses.append("user_id = %s")
+        params.append(who.get("id"))
+    if status:
+        clauses.append("status = %s")
+        params.append(status.upper())
+    where = ("WHERE " + " AND ".join(clauses)) if clauses else ""
+    with db.transaction() as cur:
+        return load_orders(cur, where, tuple(params))
 
-    if not existing:
-        raise HTTPException(404, "order not found")
 
-    if payload.status == "CANCELLED" and existing["status"] == "CREATED":
-        reserve_items = [
-            {"productId": item["product_id"], "quantity": item["quantity"]}
-            for item in existing["items"]
-        ]
-        async with httpx.AsyncClient(timeout=5.0) as client:
-            release = await client.post(
-                f"{INVENTORY_URL}/inventory/release",
-                json={"items": reserve_items},
-            )
-            if release.status_code >= 400:
-                raise HTTPException(409, "could not release reserved inventory")
+@app.get("/api/orders/{order_id}")
+def get_order(order_id: int, who: Caller = Depends(caller)):
+    order = load_order(order_id)
+    ensure_access(order, who)
+    return order
 
-    with conn() as db:
-        with db.cursor() as cur:
-            cur.execute("""
-                UPDATE orders SET status=%s,updated_at=NOW()
-                WHERE id=%s
-                RETURNING *
-            """, (payload.status, order_id))
-            row = cur.fetchone()
-    return serialize(row)
+
+@app.post("/api/orders/{order_id}/cancel")
+def cancel_order(order_id: int, who: Caller = Depends(caller)):
+    order = load_order(order_id)
+    ensure_access(order, who)
+    if order["status"] != "PENDING_PAYMENT":
+        raise HTTPException(409, f"an order that is {order['status'].lower().replace('_', ' ')} can no longer be cancelled")
+    with db.transaction() as cur:
+        cur.execute("UPDATE orders SET status = 'CANCELLED' WHERE id = %s AND status = 'PENDING_PAYMENT'", (order_id,))
+        if cur.rowcount == 0:
+            raise HTTPException(409, "order status changed, please refresh")
+    clients.release_stock(order_id)
+    clients.notify(order["user_email"], "ORDER_CANCELLED", f"Order #{order_id} cancelled",
+                   "Your order was cancelled and the reserved items are back in stock.", order_id)
+    return load_order(order_id)
+
+
+@app.patch("/api/orders/{order_id}/status")
+def update_status(order_id: int, payload: StatusUpdate, who: Caller = Depends(caller)):
+    if not who.is_admin:
+        raise HTTPException(403, "admin access required")
+    order = load_order(order_id)
+    allowed = {"SHIPPED": "PAID", "DELIVERED": "SHIPPED"}
+    if order["status"] != allowed[payload.status]:
+        raise HTTPException(409, f"cannot move an order from {order['status']} to {payload.status}")
+    with db.transaction() as cur:
+        cur.execute("UPDATE orders SET status = %s WHERE id = %s", (payload.status, order_id))
+    messages = {
+        "SHIPPED": ("Your order is on the way", f"Order #{order_id} has shipped."),
+        "DELIVERED": ("Your order was delivered", f"Order #{order_id} has been delivered. Enjoy!"),
+    }
+    title, text = messages[payload.status]
+    clients.notify(order["user_email"], f"ORDER_{payload.status}", title, text, order_id)
+    return load_order(order_id)
+
+
+@app.post("/api/orders/{order_id}/mark-paid", dependencies=[Depends(internal_only)])
+def mark_paid(order_id: int):
+    """Called by payment-service after a successful charge. Safe to call twice."""
+    order = load_order(order_id)
+    if order["status"] == "PAID":
+        return order
+    if order["status"] != "PENDING_PAYMENT":
+        raise HTTPException(409, f"order is {order['status']} and cannot be paid")
+    with db.transaction() as cur:
+        cur.execute("UPDATE orders SET status = 'PAID', paid_at = NOW() WHERE id = %s", (order_id,))
+    return load_order(order_id)

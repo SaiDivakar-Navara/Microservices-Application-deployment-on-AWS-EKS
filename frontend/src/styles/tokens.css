@@ -1,0 +1,60 @@
+:root {
+  /* Colour */
+  --ink: #12142b;
+  --ink-soft: #4a4f6a;
+  --ink-faint: #7b8099;
+  --line: #e2e4ee;
+  --fog: #f1f2f8;
+  --page: #fafafc;
+  --paper: #ffffff;
+  --brand: #3a3af5;
+  --brand-deep: #2626c4;
+  --brand-tint: #e9e9ff;
+  --sun: #ffd43b;
+  --sun-deep: #f0b800;
+  --coral: #ff5a4e;
+  --coral-tint: #ffe9e6;
+  --good: #0c8f55;
+  --good-tint: #dff5ea;
+  --warn-tint: #fff1cc;
+  --warn-ink: #7a5a00;
+
+  /* Type */
+  --font-display: "Bricolage Grotesque Variable", "Segoe UI", system-ui, sans-serif;
+  --font-body: "Figtree Variable", "Segoe UI", system-ui, sans-serif;
+
+  /* Shape: blocks are soft, controls are pills, fields sit in between */
+  --r-block: 22px;
+  --r-field: 12px;
+  --r-pill: 999px;
+
+  --shadow-pop: 0 18px 40px -12px rgba(18, 20, 43, 0.28);
+  --gutter: clamp(16px, 4vw, 40px);
+  --max: 1240px;
+}
+
+:root[data-theme="dark"] {
+  color-scheme: dark;
+}
+
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    --ink: #eceefc;
+    --ink-soft: #b4b8d4;
+    --ink-faint: #8c91b0;
+    --line: #2b2e4a;
+    --fog: #1b1d33;
+    --page: #0f1121;
+    --paper: #161830;
+    --brand: #7b7bff;
+    --brand-deep: #a3a3ff;
+    --brand-tint: #25255a;
+    --coral-tint: #3d1f27;
+    --good: #3ad693;
+    --good-tint: #123a2a;
+    --warn-tint: #3b3010;
+    --warn-ink: #ffd96a;
+    --shadow-pop: 0 18px 40px -12px rgba(0, 0, 0, 0.6);
+    color-scheme: dark;
+  }
+}

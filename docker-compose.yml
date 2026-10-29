@@ -1,169 +1,117 @@
+# Runs the whole platform locally: Postgres + 7 microservices + the React storefront.
+#   docker compose up --build        then open http://localhost:8080
+
+x-db: &db
+  DB_HOST: postgres
+  DB_PORT: "5432"
+  DB_USER: verve
+  DB_PASSWORD: verve_pass
+  DB_SSLMODE: disable
+
+x-peers: &peers
+  INTERNAL_API_KEY: ${INTERNAL_API_KEY:-verve-internal-dev-key}
+  AUTH_URL: http://auth-service:8081
+  CATALOG_URL: http://catalog-service:8082
+  INVENTORY_URL: http://inventory-service:8083
+  ORDER_URL: http://order-service:8084
+  PAYMENT_URL: http://payment-service:8085
+  NOTIFICATION_URL: http://notification-service:8086
+
 services:
-
   postgres:
-    image: postgres:16
-    container_name: microservices-postgres
-
+    image: postgres:16-alpine
     environment:
       POSTGRES_USER: postgres
       POSTGRES_PASSWORD: postgres
-
     ports:
       - "5432:5432"
-
     volumes:
       - postgres_data:/var/lib/postgresql/data
-      - ./database/bootstrap.sql:/docker-entrypoint-initdb.d/bootstrap.sql:ro
-
+      - ./database/init.sql:/docker-entrypoint-initdb.d/init.sql:ro
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U postgres"]
       interval: 5s
       timeout: 5s
-      retries: 10
-
+      retries: 20
 
   auth-service:
-    build:
-      context: ./services/auth-service
-
-    image: auth-service:1.0
-
+    build: ./services/auth-service
+    image: verve/auth-service:1.0
     environment:
-      AUTH_DB_URL: jdbc:postgresql://postgres:5432/auth_db
-      DB_USER: microapp
-      DB_PASSWORD: microapp123
-
-    ports:
-      - "8081:8081"
-
+      <<: [*db, *peers]
+      DB_NAME: auth_db
+    ports: ["8081:8081"]
     depends_on:
-      postgres:
-        condition: service_healthy
-
+      postgres: { condition: service_healthy }
 
   catalog-service:
-    build:
-      context: ./services/catalog-service
-
-    image: catalog-service:1.0
-
+    build: ./services/catalog-service
+    image: verve/catalog-service:1.0
     environment:
-      CATALOG_DB_DSN: postgres://microapp:microapp123@postgres:5432/catalog_db?sslmode=disable
-
-    ports:
-      - "8082:8082"
-
+      <<: [*db, *peers]
+      DB_NAME: catalog_db
+    ports: ["8082:8082"]
     depends_on:
-      postgres:
-        condition: service_healthy
-
+      postgres: { condition: service_healthy }
 
   inventory-service:
-    build:
-      context: ./services/inventory-service
-
-    image: inventory-service:1.0
-
+    build: ./services/inventory-service
+    image: verve/inventory-service:1.0
     environment:
-      INVENTORY_DB_URL: postgres://microapp:microapp123@postgres:5432/inventory_db
-
-    ports:
-      - "8083:8083"
-
+      <<: [*db, *peers]
+      DB_NAME: inventory_db
+    ports: ["8083:8083"]
     depends_on:
-      postgres:
-        condition: service_healthy
-
+      postgres: { condition: service_healthy }
 
   order-service:
-    build:
-      context: ./services/order-service
-
-    image: order-service:1.0
-
+    build: ./services/order-service
+    image: verve/order-service:1.0
     environment:
-      ORDER_DB_DSN: "dbname=order_db user=microapp password=microapp123 host=postgres port=5432"
-      CATALOG_URL: http://catalog-service:8082
-      INVENTORY_URL: http://inventory-service:8083
-      NOTIFICATION_URL: http://notification-service:8086
-
-    ports:
-      - "8084:8084"
-
+      <<: [*db, *peers]
+      DB_NAME: order_db
+    ports: ["8084:8084"]
     depends_on:
-      postgres:
-        condition: service_healthy
-
+      postgres: { condition: service_healthy }
 
   payment-service:
-    build:
-      context: ./services/payment-service
-
-    image: payment-service:1.0
-
+    build: ./services/payment-service
+    image: verve/payment-service:1.0
     environment:
-      PAYMENT_DB_URL: "Host=postgres;Port=5432;Database=payment_db;Username=microapp;Password=microapp123"
-      ORDER_URL: http://order-service:8084
-      INVENTORY_URL: http://inventory-service:8083
-      NOTIFICATION_URL: http://notification-service:8086
-
-    ports:
-      - "8085:8085"
-
+      <<: [*db, *peers]
+      DB_NAME: payment_db
+    ports: ["8085:8085"]
     depends_on:
-      postgres:
-        condition: service_healthy
-
+      postgres: { condition: service_healthy }
 
   notification-service:
-    build:
-      context: ./services/notification-service
-
-    image: notification-service:1.0
-
+    build: ./services/notification-service
+    image: verve/notification-service:1.0
     environment:
-      NOTIFICATION_DB_URL: postgres://microapp:microapp123@postgres:5432/notification_db
-
-    ports:
-      - "8086:8086"
-
+      <<: [*db, *peers]
+      DB_NAME: notification_db
+    ports: ["8086:8086"]
     depends_on:
-      postgres:
-        condition: service_healthy
-
+      postgres: { condition: service_healthy }
 
   analytics-service:
-    build:
-      context: ./services/analytics-service
-
-    image: analytics-service:1.0
-
+    build: ./services/analytics-service
+    image: verve/analytics-service:1.0
     environment:
-      ANALYTICS_DB_DSN: "pgsql:host=postgres;port=5432;dbname=analytics_db"
-      DB_USER: microapp
-      DB_PASSWORD: microapp123
-
-      CATALOG_URL: http://catalog-service:8082
-      INVENTORY_URL: http://inventory-service:8083
-      ORDER_URL: http://order-service:8084
-      PAYMENT_URL: http://payment-service:8085
-
-    ports:
-      - "8087:8087"
-
+      <<: [*db, *peers]
+      DB_NAME: analytics_db
+    ports: ["8087:8087"]
     depends_on:
-      postgres:
-        condition: service_healthy
+      postgres: { condition: service_healthy }
 
   frontend:
-    build:
-      context: ./frontend
-
-    image: polyglot-commerce-frontend:1.0
-
+    build: ./frontend
+    image: verve/frontend:1.0
     ports:
       - "8080:80"
-
+    volumes:
+      # Compose has no ingress, so this variant of nginx.conf also proxies /api/<service>.
+      - ./frontend/nginx.compose.conf:/etc/nginx/conf.d/default.conf:ro
     depends_on:
       - auth-service
       - catalog-service

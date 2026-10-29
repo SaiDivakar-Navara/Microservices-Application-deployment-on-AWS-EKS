@@ -1,276 +1,131 @@
-using System.Net.Http.Json;
+using System.Net;
 using System.Text.Json;
-using Npgsql;
 
 var builder = WebApplication.CreateBuilder(args);
-builder.Services.AddCors(options =>
-{
-    options.AddDefaultPolicy(policy =>
-        policy.AllowAnyOrigin().AllowAnyHeader().AllowAnyMethod());
-});
+builder.WebHost.UseUrls($"http://0.0.0.0:{Environment.GetEnvironmentVariable("PORT") ?? "8085"}");
+builder.Services.ConfigureHttpJsonOptions(o => o.SerializerOptions.PropertyNamingPolicy = JsonNamingPolicy.SnakeCaseLower);
 builder.Services.AddHttpClient();
+builder.Services.AddSingleton<PaymentStore>();
+builder.Services.AddSingleton<Peers>();
 
 var app = builder.Build();
-app.UseCors();
+await app.Services.GetRequiredService<PaymentStore>().InitializeAsync();
 
-var connectionString =
-    Environment.GetEnvironmentVariable("PAYMENT_DB_URL")
-    ?? "Host=127.0.0.1;Port=5432;Database=payment_db;Username=microapp;Password=microapp123";
+IResult Error(int status, string message) => Results.Json(new ErrorBody(message), statusCode: status);
 
-var orderUrl = Environment.GetEnvironmentVariable("ORDER_URL") ?? "http://localhost:8084";
-var inventoryUrl = Environment.GetEnvironmentVariable("INVENTORY_URL") ?? "http://localhost:8083";
-var notificationUrl = Environment.GetEnvironmentVariable("NOTIFICATION_URL") ?? "http://localhost:8086";
-var dataSource = NpgsqlDataSource.Create(connectionString);
+// ---------- health ----------
+async Task<IResult> Health(PaymentStore store) =>
+    await store.PingAsync()
+        ? Results.Ok(new { service = "payment-service", status = "UP", language = "C#" })
+        : Results.Json(new { service = "payment-service", status = "DOWN" }, statusCode: 503);
 
-await using (var conn = await dataSource.OpenConnectionAsync())
-await using (var cmd = new NpgsqlCommand("""
-    CREATE TABLE IF NOT EXISTS payments (
-        id BIGSERIAL PRIMARY KEY,
-        order_id BIGINT NOT NULL,
-        amount NUMERIC(12,2) NOT NULL CHECK(amount>0),
-        method VARCHAR(40) NOT NULL,
-        status VARCHAR(40) NOT NULL,
-        transaction_ref VARCHAR(100) NOT NULL UNIQUE,
-        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-        refunded_at TIMESTAMPTZ NULL
-    )
-    """, conn))
+app.MapGet("/health", Health);
+app.MapGet("/api/payments/health", Health);
+
+// ---------- list payments ----------
+// Shoppers see their own payments. Admins (?all=true) and other services see everyone's.
+app.MapGet("/api/payments", async (HttpRequest request, PaymentStore store, Peers peers) =>
 {
-    await cmd.ExecuteNonQueryAsync();
+    var internalCall = request.Headers["X-Internal-Key"] == Peers.InternalKey;
+    AuthUser? user = null;
+    if (!internalCall)
+    {
+        user = await peers.GetUserAsync(request.Headers.Authorization);
+        if (user is null) return Error(401, "sign in required");
+    }
+
+    var everyone = request.Query["all"] == "true" && (internalCall || user!.Role == "ADMIN");
+    long? orderId = long.TryParse(request.Query["order_id"].ToString(), out var parsed) ? parsed : null;
+    var payments = await store.ListAsync(everyone ? null : user!.Email.ToLowerInvariant(), orderId);
+    return Results.Ok(payments);
+});
+
+// ---------- pay for an order ----------
+app.MapPost("/api/payments", async (PayRequest body, HttpRequest request, PaymentStore store, Peers peers) =>
+{
+    string? authorization = request.Headers.Authorization;
+    var user = await peers.GetUserAsync(authorization);
+    if (user is null) return Error(401, "sign in required");
+
+    var method = (body.Method ?? "").Trim().ToUpperInvariant();
+    string? last4 = null;
+    if (method == "CARD")
+    {
+        var digits = new string((body.CardNumber ?? "").Where(char.IsDigit).ToArray());
+        if (digits.Length is < 13 or > 19) return Error(400, "Enter a valid card number.");
+        last4 = digits[^4..];
+    }
+    else if (method == "UPI")
+    {
+        var upi = (body.UpiId ?? "").Trim();
+        if (!upi.Contains('@') || upi.Length < 5) return Error(400, "Enter a valid UPI ID, for example name@bank.");
+    }
+    else
+    {
+        return Error(400, "method must be CARD or UPI.");
+    }
+
+    // The order service confirms the order exists and belongs to this shopper.
+    var (status, order) = await peers.GetOrderAsync(body.OrderId, authorization, asInternal: false);
+    if (status == HttpStatusCode.NotFound || order is null) return Error(404, "order not found");
+
+    var orderStatus = order.Value.GetProperty("status").GetString();
+    var amount = order.Value.GetProperty("total").GetDecimal();
+    var email = user.Email.ToLowerInvariant();
+
+    // A previous attempt may have charged the card but failed to update the order. Finish that job.
+    var earlier = await store.FindSucceededAsync(body.OrderId);
+    if (earlier is not null)
+    {
+        if (orderStatus != "PENDING_PAYMENT") return Error(409, "this order is already paid");
+        return await Finalize(earlier);
+    }
+    if (orderStatus != "PENDING_PAYMENT") return Error(409, $"this order is {orderStatus?.ToLowerInvariant()} and cannot be paid");
+
+    var failure = SimulateGateway(method, body, last4);
+    var reference = "PAY-" + Guid.NewGuid().ToString("N")[..12].ToUpperInvariant();
+
+    if (failure is not null)
+    {
+        var failed = await store.InsertAsync(body.OrderId, email, amount, method, "FAILED", reference, last4, failure);
+        await peers.NotifyAsync(email, "PAYMENT_FAILED", $"Payment failed for order #{body.OrderId}", failure, body.OrderId);
+        return Results.Json(new ErrorWithPayment(failure, failed), statusCode: 402);
+    }
+
+    var succeeded = await store.InsertAsync(body.OrderId, email, amount, method, "SUCCEEDED", reference, last4, null);
+    return await Finalize(succeeded);
+
+    async Task<IResult> Finalize(Payment payment)
+    {
+        try
+        {
+            await peers.MarkOrderPaidAsync(payment.OrderId);
+            await peers.CommitStockAsync(payment.OrderId);
+        }
+        catch (HttpRequestException ex)
+        {
+            Console.WriteLine($"payment {payment.Reference} captured but order update failed: {ex.Message}");
+            return Error(502, "Your payment went through, but we could not update the order yet. Press Pay again to finish.");
+        }
+        await peers.NotifyAsync(payment.UserEmail, "PAYMENT_SUCCEEDED", $"Payment received for order #{payment.OrderId}",
+            $"We received ${payment.Amount:0.00}. Your order is confirmed and will ship soon. Reference {payment.Reference}.", payment.OrderId);
+        return Results.Json(payment, statusCode: 201);
+    }
+});
+
+// Stand-in for a real payment gateway. Returns a failure reason, or null when the charge succeeds.
+//   Card ending 0002 -> declined.   Card ending 9995 -> insufficient funds.   UPI ID containing "fail" -> declined.
+static string? SimulateGateway(string method, PayRequest body, string? last4)
+{
+    if (method == "CARD")
+    {
+        if (last4 == "0002") return "Your card was declined. Try a different card.";
+        if (last4 == "9995") return "Insufficient funds on this card.";
+        return null;
+    }
+    return (body.UpiId ?? "").Contains("fail", StringComparison.OrdinalIgnoreCase)
+        ? "The UPI request was declined by your bank."
+        : null;
 }
 
-app.MapGet("/health", async () =>
-{
-    await using var conn = await dataSource.OpenConnectionAsync();
-    await using var cmd = new NpgsqlCommand("SELECT 1", conn);
-    await cmd.ExecuteScalarAsync();
-    return Results.Ok(new { service = "payment-service", status = "UP", language = "C#" });
-});
-
-app.MapGet("/payments", async () =>
-{
-    var result = new List<object>();
-    await using var conn = await dataSource.OpenConnectionAsync();
-    await using var cmd = new NpgsqlCommand("""
-        SELECT id,order_id,amount,method,status,transaction_ref,created_at,refunded_at
-        FROM payments ORDER BY id DESC
-        """, conn);
-    await using var reader = await cmd.ExecuteReaderAsync();
-
-    while (await reader.ReadAsync())
-    {
-        result.Add(new
-        {
-            id = reader.GetInt64(0),
-            orderId = reader.GetInt64(1),
-            amount = reader.GetDecimal(2),
-            method = reader.GetString(3),
-            status = reader.GetString(4),
-            transactionRef = reader.GetString(5),
-            createdAt = reader.GetDateTime(6),
-            refundedAt = reader.IsDBNull(7) ? (DateTime?)null : reader.GetDateTime(7)
-        });
-    }
-    return Results.Ok(result);
-});
-
-app.MapPost("/payments", async (PaymentCreate input, IHttpClientFactory factory) =>
-{
-    if (input.OrderId <= 0 || input.Amount <= 0)
-        return Results.BadRequest(new { error = "orderId and positive amount are required" });
-
-    var method = (input.Method ?? "CARD").ToUpperInvariant();
-    if (method is not ("CARD" or "UPI" or "NETBANKING"))
-        return Results.BadRequest(new { error = "method must be CARD, UPI or NETBANKING" });
-
-    var client = factory.CreateClient();
-
-    var orderResponse = await client.GetAsync($"{orderUrl}/orders/{input.OrderId}");
-    if (!orderResponse.IsSuccessStatusCode)
-        return Results.BadRequest(new { error = "order does not exist or Order Service is unavailable" });
-
-    var order = await orderResponse.Content.ReadFromJsonAsync<JsonElement>();
-    var orderTotal = order.GetProperty("total").GetDecimal();
-    var orderStatus = order.GetProperty("status").GetString() ?? "";
-
-    if (orderStatus != "CREATED")
-        return Results.Conflict(new { error = $"order must be CREATED before payment; current status={orderStatus}" });
-
-    if (decimal.Round(orderTotal, 2) != decimal.Round(input.Amount, 2))
-        return Results.BadRequest(new { error = $"payment amount must equal authoritative order total {orderTotal:0.00}" });
-
-    var orderRecipient = order.GetProperty("user_email").GetString() ?? "admin@devopsshack.com";
-    var items = order.GetProperty("items")
-        .EnumerateArray()
-        .Select(x => new InventoryItem(
-            x.GetProperty("product_id").GetInt64(),
-            x.GetProperty("quantity").GetInt32()
-        ))
-        .ToList();
-
-    await using var conn = await dataSource.OpenConnectionAsync();
-
-    await using (var existsCmd = new NpgsqlCommand(
-        "SELECT COUNT(*) FROM payments WHERE order_id=@orderId AND status='CAPTURED'", conn))
-    {
-        existsCmd.Parameters.AddWithValue("orderId", input.OrderId);
-        var exists = Convert.ToInt64(await existsCmd.ExecuteScalarAsync());
-        if (exists > 0)
-            return Results.Conflict(new { error = "order already has a captured payment" });
-    }
-
-    var commit = await client.PostAsJsonAsync(
-        $"{inventoryUrl}/inventory/commit",
-        new { items = items.Select(x => new { productId = x.ProductId, quantity = x.Quantity }) }
-    );
-    if (!commit.IsSuccessStatusCode)
-        return Results.Conflict(new { error = "could not commit reserved inventory; payment was not captured" });
-
-    var transactionRef =
-        $"TXN-{DateTimeOffset.UtcNow:yyyyMMddHHmmss}-{Guid.NewGuid().ToString("N")[..8].ToUpper()}";
-
-    long paymentId;
-    try
-    {
-        await using var cmd = new NpgsqlCommand("""
-            INSERT INTO payments(order_id,amount,method,status,transaction_ref)
-            VALUES(@orderId,@amount,@method,'CAPTURED',@ref)
-            RETURNING id
-            """, conn);
-        cmd.Parameters.AddWithValue("orderId", input.OrderId);
-        cmd.Parameters.AddWithValue("amount", input.Amount);
-        cmd.Parameters.AddWithValue("method", method);
-        cmd.Parameters.AddWithValue("ref", transactionRef);
-        paymentId = Convert.ToInt64(await cmd.ExecuteScalarAsync());
-    }
-    catch
-    {
-        await client.PostAsJsonAsync(
-            $"{inventoryUrl}/inventory/return",
-            new { items = items.Select(x => new { productId = x.ProductId, quantity = x.Quantity }) }
-        );
-        throw;
-    }
-
-    try
-    {
-        await client.PutAsJsonAsync(
-            $"{orderUrl}/orders/{input.OrderId}/status",
-            new { status = "PAID" }
-        );
-    }
-    catch { }
-
-    try
-    {
-        await client.PostAsJsonAsync(
-            $"{notificationUrl}/notifications",
-            new
-            {
-                recipient = input.Recipient ?? orderRecipient,
-                type = "PAYMENT",
-                subject = $"Payment captured for order #{input.OrderId}",
-                message = $"Payment ${input.Amount:0.00} captured successfully. Ref: {transactionRef}"
-            }
-        );
-    }
-    catch { }
-
-    return Results.Created(
-        $"/payments/{paymentId}",
-        new
-        {
-            id = paymentId,
-            orderId = input.OrderId,
-            amount = input.Amount,
-            method,
-            status = "CAPTURED",
-            transactionRef
-        }
-    );
-});
-
-app.MapPost("/payments/{id:long}/refund", async (long id, IHttpClientFactory factory) =>
-{
-    await using var conn = await dataSource.OpenConnectionAsync();
-
-    long orderId;
-    decimal amount;
-    string status;
-
-    await using (var get = new NpgsqlCommand(
-        "SELECT order_id,amount,status FROM payments WHERE id=@id", conn))
-    {
-        get.Parameters.AddWithValue("id", id);
-        await using var reader = await get.ExecuteReaderAsync();
-        if (!await reader.ReadAsync())
-            return Results.NotFound(new { error = "payment not found" });
-
-        orderId = reader.GetInt64(0);
-        amount = reader.GetDecimal(1);
-        status = reader.GetString(2);
-    }
-
-    if (status == "REFUNDED")
-        return Results.Conflict(new { error = "payment already refunded" });
-
-    var client = factory.CreateClient();
-    var orderResponse = await client.GetAsync($"{orderUrl}/orders/{orderId}");
-    if (!orderResponse.IsSuccessStatusCode)
-        return Results.Conflict(new { error = "could not load order for refund" });
-
-    var order = await orderResponse.Content.ReadFromJsonAsync<JsonElement>();
-    var orderRecipient = order.GetProperty("user_email").GetString() ?? "admin@devopsshack.com";
-    var items = order.GetProperty("items")
-        .EnumerateArray()
-        .Select(x => new InventoryItem(
-            x.GetProperty("product_id").GetInt64(),
-            x.GetProperty("quantity").GetInt32()
-        ))
-        .ToList();
-
-    var restock = await client.PostAsJsonAsync(
-        $"{inventoryUrl}/inventory/return",
-        new { items = items.Select(x => new { productId = x.ProductId, quantity = x.Quantity }) }
-    );
-    if (!restock.IsSuccessStatusCode)
-        return Results.Conflict(new { error = "inventory could not be returned; refund was not completed" });
-
-    await using (var update = new NpgsqlCommand(
-        "UPDATE payments SET status='REFUNDED',refunded_at=NOW() WHERE id=@id", conn))
-    {
-        update.Parameters.AddWithValue("id", id);
-        await update.ExecuteNonQueryAsync();
-    }
-
-    try
-    {
-        await client.PutAsJsonAsync(
-            $"{orderUrl}/orders/{orderId}/status",
-            new { status = "REFUNDED" }
-        );
-    }
-    catch { }
-
-    try
-    {
-        await client.PostAsJsonAsync(
-            $"{notificationUrl}/notifications",
-            new
-            {
-                recipient = orderRecipient,
-                type = "REFUND",
-                subject = $"Payment refunded for order #{orderId}",
-                message = $"Refund of ${amount:0.00} completed for payment #{id}."
-            }
-        );
-    }
-    catch { }
-
-    return Results.Ok(new { id, orderId, amount, status = "REFUNDED" });
-});
-
-app.Run("http://0.0.0.0:8085");
-
-record PaymentCreate(long OrderId, decimal Amount, string? Method, string? Recipient);
-record InventoryItem(long ProductId, int Quantity);
+app.Run();

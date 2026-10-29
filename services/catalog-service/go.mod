@@ -1,4 +1,4 @@
-module devopsshack/catalog-service
+module verve/catalog-service
 
 go 1.22
 
